@@ -1,11 +1,11 @@
-
+import json
 import streamlit as st
 from langchain_openai import ChatOpenAI
 from langchain.agents import initialize_agent, Tool, AgentType
 from langchain.memory import ConversationBufferMemory
+from langchain.prompts import ChatPromptTemplate
+from langchain.output_parsers import StructuredOutputParser, ResponseSchema
 from dotenv import load_dotenv
-import os
-import re
 import fitz  # PyMuPDF
 
 # Load environment variables
@@ -18,22 +18,51 @@ memory = ConversationBufferMemory(memory_key="chat_history", return_messages=Tru
 # Global storage for application info
 application_info = {"name": None, "email": None, "skills": None}
 
-# Extract info from plain text (chat or resume)
-def extract_application_info(text: str) -> str:
-    name_match = re.search(r"(?:my name is|i am)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)", text, re.IGNORECASE)
-    email_match = re.search(r"\b[\w\.-]+@[\w\.-]+\.\w+\b", text)
-    skills_match = re.search(r"(?:skills are|i know|i can use)\s+(.+)", text, re.IGNORECASE)
+# --- LLM-based extraction ---
+response_schemas = [
+    ResponseSchema(name="name", description="The applicant's full name, if present."),
+    ResponseSchema(name="email", description="The applicant's email address, if present."),
+    ResponseSchema(name="skills", description="A list of skills mentioned."),
+]
 
-    if name_match:
-        application_info["name"] = name_match.group(1).title()
-    if email_match:
-        application_info["email"] = email_match.group(0)
-    if skills_match:
-        application_info["skills"] = skills_match.group(1).strip()
+output_parser = StructuredOutputParser.from_response_schemas(response_schemas)
+
+prompt_template = ChatPromptTemplate.from_messages([
+    (
+        "system",
+        "You are an assistant that extracts job application information from text. "
+        "Always return valid JSON with the following exact keys, all lowercase:\n"
+        "- name (string)\n"
+        "- email (string)\n"
+        "- skills (array of strings)\n\n"
+        "Do not change the casing of keys. Keys must be exactly as written."
+    ),
+    (
+        "user",
+        "{text}\n\nReturn only the JSON object, no explanations."
+    ),
+])
+
+def extract_application_info_llm(text: str) -> str:
+    prompt = prompt_template.format_messages(text=text)
+    response = llm(prompt)
+
+    try:
+        parsed = output_parser.parse( response.content)
+       
+        
+    except Exception:
+        raw_json = json.loads(response.content)
+        raw_json = {k.lower(): v for k, v in raw_json.items()}
+        parsed = raw_json
+
+    for key in application_info:
+        if parsed.get(key):
+            application_info[key] = parsed[key]
 
     return "Got it. Let me check what else I need."
 
-# Extract info from uploaded CV
+# Extract text from uploaded CV
 def extract_text_from_pdf(uploaded_file):
     doc = fitz.open(stream=uploaded_file.read(), filetype="pdf")
     text = ""
@@ -42,21 +71,8 @@ def extract_text_from_pdf(uploaded_file):
     doc.close()
     return text
 
-def extract_info_from_cv(text: str):
-    extracted_info = {"name": None, "email": None, "skills": None}
-    name_match = re.search(r"(?:Full Name:|Name:)\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)", text)
-    email_match = re.search(r"\b[\w\.-]+@[\w\.-]+\.\w+\b", text)
-    skills_match = re.search(r"Skills\s*-+\s*(.*?)\n(?:Projects|Certifications|$)", text, re.DOTALL)
-
-    if name_match:
-        extracted_info["name"] = name_match.group(1).strip()
-    if email_match:
-        extracted_info["email"] = email_match.group(0).strip()
-    if skills_match:
-        skills = skills_match.group(1).replace("\n", ", ").replace("\u2022", "").replace("-", "")
-        extracted_info["skills"] = re.sub(r"\s+", " ", skills.strip())
-
-    return extracted_info
+def extract_info_from_cv_llm(text: str):
+    return extract_application_info_llm(text)
 
 # Goal checker
 def check_application_goal(_: str) -> str:
@@ -68,8 +84,16 @@ def check_application_goal(_: str) -> str:
 
 # Define tools for LangChain agent
 tools = [
-    Tool(name="extract_application_info", func=extract_application_info, description="Extract name, email, skills"),
-    Tool(name="check_application_goal", func=check_application_goal, description="Check completion")
+    Tool(
+        name="extract_application_info",
+        func=extract_application_info_llm,
+        description="Use this to extract name, email, and skills from text."
+    ),
+    Tool(
+        name="check_application_goal",
+        func=check_application_goal,
+        description="Check whether all required fields (name, email, skills) are filled."
+    ),
 ]
 
 agent = initialize_agent(
@@ -80,7 +104,7 @@ agent = initialize_agent(
     verbose=False
 )
 
-# Streamlit UI
+# --- Streamlit UI ---
 st.set_page_config(page_title="🎯 Job Application Assistant", layout="centered")
 st.title("🧠 Goal-Based Agent: Job Application Assistant")
 st.markdown("Tell me your **name**, **email**, and **skills** to complete your application!")
@@ -102,12 +126,9 @@ resume = st.sidebar.file_uploader("Upload your resume", type=["pdf", "txt"])
 if resume:
     st.sidebar.success("Resume uploaded!")
     text = extract_text_from_pdf(resume)
-    extracted = extract_info_from_cv(text)
-    for key in application_info:
-        if extracted[key]:
-            application_info[key] = extracted[key]
+    extract_info_from_cv_llm(text)
     st.sidebar.info("🔍 Extracted info from resume:")
-    for key, value in extracted.items():
+    for key, value in application_info.items():
         st.sidebar.markdown(f"**{key.capitalize()}:** {value}")
 
 # Reset chat
@@ -118,14 +139,14 @@ if st.sidebar.button("🔄 Reset Chat"):
     st.session_state.application_summary = ""
     for key in application_info:
         application_info[key] = None
-    st.experimental_rerun()
+    st.rerun()
 
 # Chat input
 user_input = st.chat_input("Type here...")
 
 if user_input:
     st.session_state.chat_history.append(("user", user_input))
-    extract_application_info(user_input)
+    extract_application_info_llm(user_input)
     response = agent.invoke({"input": user_input})
     bot_reply = response["output"]
     st.session_state.chat_history.append(("bot", bot_reply))
